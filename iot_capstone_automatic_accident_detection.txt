@@ -1,0 +1,214 @@
+#include <WiFi.h>
+#include <ThingSpeak.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_MPU6050.h>
+#include <TinyGPS++.h>
+#include <HTTPClient.h>
+#include <Arduino.h>
+#include <mbedtls/base64.h>
+
+// Twilio API Credentials (Replace these!)
+const char* twilioSID = "AC4420937dc6f52e1ca608f3165f3ad774";
+const char* twilioAuthToken = "05d8089aa66567a5594b02bcc9f8e4a5";
+const char* twilioNumber = "whatsapp:+14155238886";  // Twilio-provided WhatsApp number
+const char* recipientNumber = "whatsapp:+917676607253";  // Guardian’s WhatsApp number
+// Wi-Fi credentials
+const char* ssid = "simple";
+const char* password = "sim123pl";
+
+// ThingSpeak API details
+#define THINGSPEAK_API_KEY "KJCJA6TX372GTR7H" // Get this from ThingSpeak
+#define THINGSPEAK_URL "http://api.thingspeak.com/update"
+
+WiFiClient client;
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;  // Create an instance of the GPS object
+
+// GPS Serial Communication (using HardwareSerial for ESP32)
+HardwareSerial gpsSerial(1); // Using UART1 (pins 4 and 5 by default)
+
+#define BUTTON_PIN 4 // Button for false alarm cancellation
+#define BUZZER_PIN 5 // Buzzer for alert
+
+// Variables to store GPS coordinates
+float latitude = 0.0;
+float longitude = 0.0, altitude = 0.0;
+static const int RXPin = 16, TXPin = 17;  // Change according to ESP32 pins
+static const uint32_t GPSBaud = 9600; 
+// Define I2C pins for MPU6050
+#define MPU_SDA 21  // SDA pin for I2C communication
+#define MPU_SCL 22  // SCL pin for I2C communication
+
+void setup() {
+  // Start serial communication
+  Serial.begin(115200);
+  gpsSerial.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin); // Initialize GPS Serial
+  
+  pinMode(BUTTON_PIN, INPUT_PULLUP);  // Enable internal pull-up resistor
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW); // Keep buzzer OFF initially
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print("connecting to wifi...");
+  }
+  Serial.println("Connected to WiFi");
+
+  // Initialize ThingSpeak
+  ThingSpeak.begin(client);
+
+ 
+  // Initialize I2C for MPU6050
+  Wire.begin(MPU_SDA, MPU_SCL);  // Explicitly set I2C pins
+
+  // Initialize MPU6050
+  if (!mpu.begin()) {
+    Serial.println("Could not find a valid MPU6050 sensor, check wiring!");
+    while (1);
+  }
+  Serial.println("MPU6050 initialized successfully.");
+  delay(1000);
+}
+
+void loop() {
+
+  // Read accelerometer data (e.g., detecting sudden impact)
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  
+  // Simulate accident detection (for example, a sudden impact threshold)
+  float impact = sqrt(a.acceleration.x * a.acceleration.x + a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z);
+  
+  // If impact exceeds a threshold, mark as accident
+  int accidentStatus = (impact > 10) ? 1 : 0; // Adjust threshold as needed
+
+  Serial.print("Impact: ");
+  Serial.println(impact);
+  Serial.print("Accident status: ");
+  Serial.println(accidentStatus);
+
+  if (impact > 10) { // Threshold for accident detection
+    Serial.println("⚠️ Impact Detected! Waiting for driver response...");
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(500); // Buzzer sounds for 1 seconds
+    digitalWrite(BUZZER_PIN, LOW);
+    
+    unsigned long startTime = millis();
+    while (millis() - startTime < 10000) { // Wait 10 seconds
+      if (digitalRead(BUTTON_PIN) == LOW) {
+        Serial.println("🚗 False Alarm! Alert Aborted.");
+        while (digitalRead(BUTTON_PIN) == LOW); // Wait until button is released
+        return; // Exit the function immediately
+      }
+      delay(100);
+    }
+
+    // No response from driver, sound buzzer
+    Serial.println("🚨 No response! Activating buzzer...");
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(2000); // Buzzer sounds for 2 seconds
+    digitalWrite(BUZZER_PIN, LOW);
+
+    // Send alert to ThingSpeak
+    Serial.println("📡 Sending accident alert...");
+
+    while (gpsSerial.available()) {
+      gps.encode(gpsSerial.read());
+      if (gps.location.isUpdated()) {
+        latitude = gps.location.lat();
+        longitude = gps.location.lng();
+        altitude = gps.altitude.meters();
+        
+        Serial.println("Sending data to ThingSpeak...");
+        sendDataToThingSpeak(latitude, longitude, altitude);  
+      }
+    }
+    sendai(accidentStatus, impact);
+    sendWhatsAppAlert(latitude, longitude);
+  }
+ 
+  // Wait for 15 seconds before sending next update
+  delay(15000);
+}
+void sendDataToThingSpeak(float lat, float lon, float alt) {
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        String url = String(THINGSPEAK_URL) + "?api_key=" + THINGSPEAK_API_KEY + 
+                     "&field1=" + String(lat, 6) + 
+                     "&field2=" + String(lon, 6) + 
+                     "&field3=" + String(alt);
+        http.begin(url);
+        int httpCode = http.GET(); // Send HTTP request
+
+        if (httpCode > 0) {
+            Serial.println("Data sent successfully!");
+        } else {
+            Serial.println("Failed to send data!");
+        }
+        http.end();
+    } else {
+        Serial.println("WiFi Disconnected!");
+    }
+}
+void sendai(int accidentStatus,float impact){
+  if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        String url = String(THINGSPEAK_URL) + "?api_key=" + THINGSPEAK_API_KEY + 
+                     "&field4=" + String(impact) +
+                     "&field5=" + String(accidentStatus);
+
+        http.begin(url);
+        int httpCode = http.GET(); // Send HTTP request
+
+        if (httpCode > 0) {
+            Serial.println("accidentStatus and impact sent successfully!");
+        } else {
+            Serial.println("Failed to send data!");
+        }
+        http.end();
+    } else {
+        Serial.println("WiFi Disconnected!");
+    }
+}
+void sendWhatsAppAlert(float lat, float lon) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    
+    String whatsappMessage = "🚨 Accident detected! Location: https://maps.google.com/?q=" + String(lat, 6) + "," + String(lon, 6);
+    String twilioUrl = "https://api.twilio.com/2010-04-01/Accounts/" + String(twilioSID) + "/Messages.json";
+    String authString = String(twilioSID) + ":" + String(twilioAuthToken);
+    String authHeader = "Basic " + base64Encode(authString); 
+    
+    String postData = "To=" + String(recipientNumber) +
+                      "&From=" + String(twilioNumber) +
+                      "&Body=" + whatsappMessage;
+
+    http.begin(twilioUrl);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");    
+    http.addHeader("Authorization", authHeader);
+
+
+    int httpCode = http.POST(postData);
+
+    if (httpCode > 0) {
+      Serial.println("📩 WhatsApp Message Sent Successfully!");
+    } else {
+      Serial.println("❌ WhatsApp Sending Failed!");
+      Serial.println(http.errorToString(httpCode));
+    }
+    http.end();
+  } else {
+    Serial.println("❌ WiFi Disconnected! Cannot send WhatsApp message.");
+  }
+}
+
+String base64Encode(String input) {
+    size_t outputLength;
+    unsigned char outputBuffer[100];  // Adjust size if needed
+    mbedtls_base64_encode(outputBuffer, sizeof(outputBuffer), &outputLength,
+                          (const unsigned char*)input.c_str(), input.length());
+    return String((char*)outputBuffer);
+}
